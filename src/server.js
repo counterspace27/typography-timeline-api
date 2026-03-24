@@ -53,6 +53,9 @@ const allowedOrigins = [
   'http://localhost:3000',
   /\.vercel\.app$/,
   /\.dreamhost\.com$/,
+  /\.counterspace\.us$/,
+  'https://counterspace.us',
+  'https://timeline.counterspace.us',
   process.env.ALLOWED_ORIGIN,
 ].filter(Boolean)
 
