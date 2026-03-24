@@ -1,369 +1,337 @@
 import express from 'express'
 import cors from 'cors'
-import pkg from '@prisma/client'
-const { PrismaClient } = pkg
-
-// Prisma connects to SQLite locally (DATABASE_URL=file:./timeline.db)
-// In production on Vercel, set TURSO_DATABASE_URL + TURSO_AUTH_TOKEN
-// and update prisma/schema.prisma provider to use @prisma/adapter-libsql
+import { createClient } from '@libsql/client'
 
 const app = express()
-const prisma = new PrismaClient()
 const PORT = process.env.PORT || 3001
 
+// ── Database ─────────────────────────────────────────────────────────
+const db = createClient({
+  url:       process.env.TURSO_DATABASE_URL || 'file:./timeline.db',
+  authToken: process.env.TURSO_AUTH_TOKEN,
+})
+
+async function initDb() {
+  await db.executeMultiple(`
+    CREATE TABLE IF NOT EXISTS TypographyEvent (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      year        INTEGER NOT NULL,
+      dateLabel   TEXT NOT NULL DEFAULT '',
+      name        TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      imageUrl    TEXT NOT NULL DEFAULT '',
+      position    TEXT NOT NULL DEFAULT 'top',
+      createdAt   TEXT NOT NULL DEFAULT (datetime('now')),
+      updatedAt   TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS HistoricalEvent (
+      id        INTEGER PRIMARY KEY AUTOINCREMENT,
+      year      INTEGER NOT NULL,
+      dateLabel TEXT NOT NULL DEFAULT '',
+      name      TEXT NOT NULL,
+      createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+      updatedAt TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS ArtMovement (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      startYear   INTEGER NOT NULL,
+      endYear     INTEGER NOT NULL,
+      datesLabel  TEXT NOT NULL DEFAULT '',
+      name        TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      createdAt   TEXT NOT NULL DEFAULT (datetime('now')),
+      updatedAt   TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `)
+}
+
+initDb().catch(e => console.error('DB init error:', e.message))
+
+// ── CORS ─────────────────────────────────────────────────────────────
 const allowedOrigins = [
-  "http://localhost:5173",
-  "http://localhost:3000",
+  'http://localhost:5173',
+  'http://localhost:3000',
   /\.vercel\.app$/,
+  /\.dreamhost\.com$/,
   process.env.ALLOWED_ORIGIN,
 ].filter(Boolean)
 
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true)
-    const ok = allowedOrigins.some(o => typeof o === "string" ? o === origin : o.test(origin))
-    cb(ok ? null : new Error("Not allowed by CORS"), ok)
+    const ok = allowedOrigins.some(o =>
+      typeof o === 'string' ? o === origin : o.test(origin)
+    )
+    cb(ok ? null : new Error('Not allowed by CORS'), ok)
   },
   credentials: true,
 }))
 app.use(express.json())
 
-// ─── helpers ────────────────────────────────────────────────────────
-function searchFilter(q) {
-  if (!q) return {}
+// ── Helpers ───────────────────────────────────────────────────────────
+function fmtY(y) { return y <= 0 ? `${Math.abs(y)} BCE` : `${y} CE` }
+
+function rowToObj(row) {
+  // libsql returns rows as objects already
+  return row
+}
+
+function applySearch(rows, q) {
+  if (!q) return rows
   const term = q.toLowerCase()
-  return term
+  return rows.filter(r => {
+    const fields = [r.name, r.dateLabel, r.datesLabel, r.description,
+      String(r.year ?? ''), String(r.startYear ?? ''), String(r.endYear ?? '')]
+    return fields.filter(Boolean).some(f => f.toLowerCase().includes(term))
+  })
 }
 
-function matchesSearch(record, term) {
-  if (!term) return true
-  const fields = [
-    record.name,
-    record.dateLabel,
-    record.datesLabel,
-    record.description,
-    String(record.year ?? ''),
-    String(record.startYear ?? ''),
-    String(record.endYear ?? ''),
-  ].filter(Boolean).map(f => f.toLowerCase())
-  return fields.some(f => f.includes(term))
+function sortRows(rows, sort, order) {
+  return [...rows].sort((a, b) => {
+    const av = a[sort] ?? 0
+    const bv = b[sort] ?? 0
+    const cmp = typeof av === 'string' ? av.localeCompare(bv) : av - bv
+    return order === 'desc' ? -cmp : cmp
+  })
 }
 
-// ─── TYPOGRAPHY EVENTS ──────────────────────────────────────────────
+// ── TYPOGRAPHY EVENTS ─────────────────────────────────────────────────
 
-// GET all (with optional ?q= search and ?sort= / ?order=)
 app.get('/api/typography', async (req, res) => {
   try {
     const { q, sort = 'year', order = 'asc' } = req.query
-    const validSorts = ['year', 'name', 'createdAt', 'updatedAt']
-    const sortField = validSorts.includes(sort) ? sort : 'year'
-    const sortOrder = order === 'desc' ? 'desc' : 'asc'
-
-    let events = await prisma.typographyEvent.findMany({
-      orderBy: { [sortField]: sortOrder },
-    })
-
-    if (q) {
-      const term = q.toLowerCase()
-      events = events.filter(e => matchesSearch(e, term))
-    }
-
-    res.json({ data: events, total: events.length })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
+    const result = await db.execute('SELECT * FROM TypographyEvent')
+    let rows = result.rows
+    if (q) rows = applySearch(rows, q)
+    rows = sortRows(rows, sort, order)
+    res.json({ data: rows, total: rows.length })
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
-// GET single
 app.get('/api/typography/:id', async (req, res) => {
   try {
-    const event = await prisma.typographyEvent.findUnique({
-      where: { id: Number(req.params.id) },
-    })
-    if (!event) return res.status(404).json({ error: 'Not found' })
-    res.json(event)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
+    const result = await db.execute({ sql: 'SELECT * FROM TypographyEvent WHERE id = ?', args: [req.params.id] })
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' })
+    res.json(result.rows[0])
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
-// CREATE
 app.post('/api/typography', async (req, res) => {
   try {
     const { year, dateLabel, name, description, imageUrl, position } = req.body
     if (!year || !name) return res.status(400).json({ error: 'year and name required' })
-    const event = await prisma.typographyEvent.create({
-      data: {
-        year: Number(year),
-        dateLabel: dateLabel || formatYear(Number(year)),
-        name,
-        description: description || '',
-        imageUrl: imageUrl || '',
-        position: position || 'top',
-      },
+    const result = await db.execute({
+      sql: `INSERT INTO TypographyEvent (year, dateLabel, name, description, imageUrl, position)
+            VALUES (?, ?, ?, ?, ?, ?) RETURNING *`,
+      args: [Number(year), dateLabel || fmtY(Number(year)), name, description || '', imageUrl || '', position || 'top']
     })
-    res.status(201).json(event)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
+    res.status(201).json(result.rows[0])
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
-// UPDATE (full or partial)
 app.patch('/api/typography/:id', async (req, res) => {
   try {
-    const data = { ...req.body }
-    if (data.year) data.year = Number(data.year)
-    delete data.id; delete data.createdAt; delete data.updatedAt
-    const event = await prisma.typographyEvent.update({
-      where: { id: Number(req.params.id) },
-      data,
+    const allowed = ['year', 'dateLabel', 'name', 'description', 'imageUrl', 'position']
+    const fields = Object.keys(req.body).filter(k => allowed.includes(k))
+    if (!fields.length) return res.status(400).json({ error: 'No valid fields' })
+    const sets = fields.map(f => `${f} = ?`).join(', ')
+    const args = [...fields.map(f => f === 'year' ? Number(req.body[f]) : req.body[f]), req.params.id]
+    const result = await db.execute({
+      sql: `UPDATE TypographyEvent SET ${sets}, updatedAt = datetime('now') WHERE id = ? RETURNING *`,
+      args
     })
-    res.json(event)
-  } catch (err) {
-    if (err.code === 'P2025') return res.status(404).json({ error: 'Not found' })
-    res.status(500).json({ error: err.message })
-  }
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' })
+    res.json(result.rows[0])
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
-// DELETE
 app.delete('/api/typography/:id', async (req, res) => {
   try {
-    await prisma.typographyEvent.delete({ where: { id: Number(req.params.id) } })
+    await db.execute({ sql: 'DELETE FROM TypographyEvent WHERE id = ?', args: [req.params.id] })
     res.json({ deleted: true })
-  } catch (err) {
-    if (err.code === 'P2025') return res.status(404).json({ error: 'Not found' })
-    res.status(500).json({ error: err.message })
-  }
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
-// ─── HISTORICAL EVENTS ──────────────────────────────────────────────
+// ── HISTORICAL EVENTS ─────────────────────────────────────────────────
 
 app.get('/api/historical', async (req, res) => {
   try {
     const { q, sort = 'year', order = 'asc' } = req.query
-    const validSorts = ['year', 'name', 'createdAt']
-    const sortField = validSorts.includes(sort) ? sort : 'year'
-    let events = await prisma.historicalEvent.findMany({
-      orderBy: { [sortField]: order === 'desc' ? 'desc' : 'asc' },
-    })
-    if (q) {
-      const term = q.toLowerCase()
-      events = events.filter(e => matchesSearch(e, term))
-    }
-    res.json({ data: events, total: events.length })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
+    const result = await db.execute('SELECT * FROM HistoricalEvent')
+    let rows = result.rows
+    if (q) rows = applySearch(rows, q)
+    rows = sortRows(rows, sort, order)
+    res.json({ data: rows, total: rows.length })
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
 app.get('/api/historical/:id', async (req, res) => {
   try {
-    const event = await prisma.historicalEvent.findUnique({ where: { id: Number(req.params.id) } })
-    if (!event) return res.status(404).json({ error: 'Not found' })
-    res.json(event)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
+    const result = await db.execute({ sql: 'SELECT * FROM HistoricalEvent WHERE id = ?', args: [req.params.id] })
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' })
+    res.json(result.rows[0])
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
 app.post('/api/historical', async (req, res) => {
   try {
     const { year, dateLabel, name } = req.body
     if (!year || !name) return res.status(400).json({ error: 'year and name required' })
-    const event = await prisma.historicalEvent.create({
-      data: { year: Number(year), dateLabel: dateLabel || formatYear(Number(year)), name },
+    const result = await db.execute({
+      sql: 'INSERT INTO HistoricalEvent (year, dateLabel, name) VALUES (?, ?, ?) RETURNING *',
+      args: [Number(year), dateLabel || fmtY(Number(year)), name]
     })
-    res.status(201).json(event)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
+    res.status(201).json(result.rows[0])
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
 app.patch('/api/historical/:id', async (req, res) => {
   try {
-    const data = { ...req.body }
-    if (data.year) data.year = Number(data.year)
-    delete data.id; delete data.createdAt; delete data.updatedAt
-    const event = await prisma.historicalEvent.update({
-      where: { id: Number(req.params.id) },
-      data,
+    const allowed = ['year', 'dateLabel', 'name']
+    const fields = Object.keys(req.body).filter(k => allowed.includes(k))
+    if (!fields.length) return res.status(400).json({ error: 'No valid fields' })
+    const sets = fields.map(f => `${f} = ?`).join(', ')
+    const args = [...fields.map(f => f === 'year' ? Number(req.body[f]) : req.body[f]), req.params.id]
+    const result = await db.execute({
+      sql: `UPDATE HistoricalEvent SET ${sets}, updatedAt = datetime('now') WHERE id = ? RETURNING *`,
+      args
     })
-    res.json(event)
-  } catch (err) {
-    if (err.code === 'P2025') return res.status(404).json({ error: 'Not found' })
-    res.status(500).json({ error: err.message })
-  }
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' })
+    res.json(result.rows[0])
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
 app.delete('/api/historical/:id', async (req, res) => {
   try {
-    await prisma.historicalEvent.delete({ where: { id: Number(req.params.id) } })
+    await db.execute({ sql: 'DELETE FROM HistoricalEvent WHERE id = ?', args: [req.params.id] })
     res.json({ deleted: true })
-  } catch (err) {
-    if (err.code === 'P2025') return res.status(404).json({ error: 'Not found' })
-    res.status(500).json({ error: err.message })
-  }
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
-// ─── ART MOVEMENTS ──────────────────────────────────────────────────
+// ── ART MOVEMENTS ─────────────────────────────────────────────────────
 
 app.get('/api/movements', async (req, res) => {
   try {
     const { q, sort = 'startYear', order = 'asc' } = req.query
-    const validSorts = ['startYear', 'endYear', 'name', 'createdAt']
-    const sortField = validSorts.includes(sort) ? sort : 'startYear'
-    let movements = await prisma.artMovement.findMany({
-      orderBy: { [sortField]: order === 'desc' ? 'desc' : 'asc' },
-    })
-    if (q) {
-      const term = q.toLowerCase()
-      movements = movements.filter(m => matchesSearch(m, term))
-    }
-    res.json({ data: movements, total: movements.length })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
+    const result = await db.execute('SELECT * FROM ArtMovement')
+    let rows = result.rows
+    if (q) rows = applySearch(rows, q)
+    rows = sortRows(rows, sort, order)
+    res.json({ data: rows, total: rows.length })
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
 app.get('/api/movements/:id', async (req, res) => {
   try {
-    const movement = await prisma.artMovement.findUnique({ where: { id: Number(req.params.id) } })
-    if (!movement) return res.status(404).json({ error: 'Not found' })
-    res.json(movement)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
+    const result = await db.execute({ sql: 'SELECT * FROM ArtMovement WHERE id = ?', args: [req.params.id] })
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' })
+    res.json(result.rows[0])
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
 app.post('/api/movements', async (req, res) => {
   try {
     const { startYear, endYear, datesLabel, name, description } = req.body
-    if (!startYear || !endYear || !name) {
-      return res.status(400).json({ error: 'startYear, endYear, and name required' })
-    }
-    const movement = await prisma.artMovement.create({
-      data: {
-        startYear: Number(startYear),
-        endYear: Number(endYear),
-        datesLabel: datesLabel || `${formatYear(Number(startYear))}–${formatYear(Number(endYear))}`,
-        name,
-        description: description || '',
-      },
+    if (!startYear || !endYear || !name) return res.status(400).json({ error: 'startYear, endYear, name required' })
+    const result = await db.execute({
+      sql: `INSERT INTO ArtMovement (startYear, endYear, datesLabel, name, description)
+            VALUES (?, ?, ?, ?, ?) RETURNING *`,
+      args: [Number(startYear), Number(endYear), datesLabel || `${fmtY(Number(startYear))}–${fmtY(Number(endYear))}`, name, description || '']
     })
-    res.status(201).json(movement)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
+    res.status(201).json(result.rows[0])
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
 app.patch('/api/movements/:id', async (req, res) => {
   try {
-    const data = { ...req.body }
-    if (data.startYear) data.startYear = Number(data.startYear)
-    if (data.endYear)   data.endYear   = Number(data.endYear)
-    delete data.id; delete data.createdAt; delete data.updatedAt
-    const movement = await prisma.artMovement.update({
-      where: { id: Number(req.params.id) },
-      data,
+    const allowed = ['startYear', 'endYear', 'datesLabel', 'name', 'description']
+    const fields = Object.keys(req.body).filter(k => allowed.includes(k))
+    if (!fields.length) return res.status(400).json({ error: 'No valid fields' })
+    const numFields = ['startYear', 'endYear']
+    const sets = fields.map(f => `${f} = ?`).join(', ')
+    const args = [...fields.map(f => numFields.includes(f) ? Number(req.body[f]) : req.body[f]), req.params.id]
+    const result = await db.execute({
+      sql: `UPDATE ArtMovement SET ${sets}, updatedAt = datetime('now') WHERE id = ? RETURNING *`,
+      args
     })
-    res.json(movement)
-  } catch (err) {
-    if (err.code === 'P2025') return res.status(404).json({ error: 'Not found' })
-    res.status(500).json({ error: err.message })
-  }
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' })
+    res.json(result.rows[0])
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
 app.delete('/api/movements/:id', async (req, res) => {
   try {
-    await prisma.artMovement.delete({ where: { id: Number(req.params.id) } })
+    await db.execute({ sql: 'DELETE FROM ArtMovement WHERE id = ?', args: [req.params.id] })
     res.json({ deleted: true })
-  } catch (err) {
-    if (err.code === 'P2025') return res.status(404).json({ error: 'Not found' })
-    res.status(500).json({ error: err.message })
-  }
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
-// ─── GLOBAL SEARCH ──────────────────────────────────────────────────
+// ── GLOBAL SEARCH ─────────────────────────────────────────────────────
 
 app.get('/api/search', async (req, res) => {
   try {
     const { q } = req.query
     if (!q) return res.json({ typography: [], historical: [], movements: [] })
-
-    const term = q.toLowerCase()
-
-    const [typo, hist, art] = await Promise.all([
-      prisma.typographyEvent.findMany({ orderBy: { year: 'asc' } }),
-      prisma.historicalEvent.findMany({ orderBy: { year: 'asc' } }),
-      prisma.artMovement.findMany({ orderBy: { startYear: 'asc' } }),
+    const [t, h, a] = await Promise.all([
+      db.execute('SELECT * FROM TypographyEvent'),
+      db.execute('SELECT * FROM HistoricalEvent'),
+      db.execute('SELECT * FROM ArtMovement'),
     ])
-
     res.json({
-      typography: typo.filter(e => matchesSearch(e, term)),
-      historical:  hist.filter(e => matchesSearch(e, term)),
-      movements:   art.filter(e  => matchesSearch(e, term)),
+      typography: applySearch(t.rows, q),
+      historical:  applySearch(h.rows, q),
+      movements:   applySearch(a.rows, q),
     })
-  } catch (err) {
-    res.status(500).json({ error: err.message })
-  }
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
-// ─── EXPORT (generates timeline-ready JSON) ─────────────────────────
+// ── EXPORT ────────────────────────────────────────────────────────────
 
 app.get('/api/export', async (req, res) => {
   try {
-    const [typography, historical, movements] = await Promise.all([
-      prisma.typographyEvent.findMany({ orderBy: { year: 'asc' } }),
-      prisma.historicalEvent.findMany({ orderBy: { year: 'asc' } }),
-      prisma.artMovement.findMany({ orderBy: { startYear: 'asc' } }),
+    const [t, h, a] = await Promise.all([
+      db.execute('SELECT * FROM TypographyEvent ORDER BY year ASC'),
+      db.execute('SELECT * FROM HistoricalEvent ORDER BY year ASC'),
+      db.execute('SELECT * FROM ArtMovement ORDER BY startYear ASC'),
     ])
-
-    // Shape matches what the HTML timeline expects
     const payload = {
       exportedAt: new Date().toISOString(),
-      typoEvents: typography.map(e => ({
-        year: e.year,
-        dateLabel: e.dateLabel,
-        name: e.name,
-        desc: e.description,
-        img: e.imageUrl,
-        pos: e.position,
-      })),
-      histEvents: historical.map(e => ({
-        year: e.year,
-        dateLabel: e.dateLabel,
-        name: e.name,
-      })),
-      artMovements: movements.map(m => ({
-        start: m.startYear,
-        end: m.endYear,
-        datesLabel: m.datesLabel,
-        name: m.name,
-        desc: m.description,
-      })),
+      typoEvents:   t.rows.map(e => ({ year: e.year, dateLabel: e.dateLabel, name: e.name, desc: e.description, img: e.imageUrl, pos: e.position })),
+      histEvents:   h.rows.map(e => ({ year: e.year, dateLabel: e.dateLabel, name: e.name })),
+      artMovements: a.rows.map(m => ({ start: m.startYear, end: m.endYear, datesLabel: m.datesLabel, name: m.name, desc: m.description })),
     }
-
     res.setHeader('Content-Disposition', 'attachment; filename="timeline-data.json"')
     res.json(payload)
-  } catch (err) {
-    res.status(500).json({ error: err.message })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// ── SEED (POST /api/seed — run once to populate Turso) ───────────────
+
+app.post('/api/seed', async (req, res) => {
+  // Simple auth check — set SEED_SECRET env var in Vercel
+  if (process.env.SEED_SECRET && req.headers['x-seed-secret'] !== process.env.SEED_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' })
+  }
+  try {
+    const { seedDatabase } = await import('./seed-data.js')
+    const counts = await seedDatabase(db)
+    res.json({ seeded: true, ...counts })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// ── HEALTH ────────────────────────────────────────────────────────────
+
+app.get('/api/health', async (_, res) => {
+  try {
+    await db.execute('SELECT 1')
+    res.json({ status: 'ok', db: 'connected', timestamp: new Date().toISOString() })
+  } catch (e) {
+    res.status(500).json({ status: 'error', db: e.message })
   }
 })
 
-// ─── HEALTH ─────────────────────────────────────────────────────────
+// ── START ─────────────────────────────────────────────────────────────
 
-app.get('/api/health', (_, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }))
-
-// ─── UTILS ──────────────────────────────────────────────────────────
-
-function formatYear(y) {
-  return y <= 0 ? `${Math.abs(y)} BCE` : `${y} CE`
-}
-
-// ─── START ──────────────────────────────────────────────────────────
-
-app.listen(PORT, () => {
-  console.log(`Timeline API running on http://localhost:${PORT}`)
-})
+app.listen(PORT, () => console.log(`Timeline API on http://localhost:${PORT}`))
 
 export default app
