@@ -1,0 +1,44 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "sqlite"
+  url       = env("DATABASE_URL")
+  // For Turso (production), swap to:
+  // provider  = "sqlite"
+  // url       = env("TURSO_DATABASE_URL")
+  // authToken = env("TURSO_AUTH_TOKEN")
+}
+
+model TypographyEvent {
+  id          Int      @id @default(autoincrement())
+  year        Int
+  dateLabel   String
+  name        String
+  description String   @default("")
+  imageUrl    String   @default("")
+  position    String   @default("top")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model HistoricalEvent {
+  id        Int      @id @default(autoincrement())
+  year      Int
+  dateLabel String
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ArtMovement {
+  id          Int      @id @default(autoincrement())
+  startYear   Int
+  endYear     Int
+  datesLabel  String
+  name        String
+  description String   @default("")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
