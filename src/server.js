@@ -21,6 +21,7 @@ async function initDb() {
       description TEXT NOT NULL DEFAULT '',
       imageUrl    TEXT NOT NULL DEFAULT '',
       position    TEXT NOT NULL DEFAULT 'top',
+      fontName    TEXT NOT NULL DEFAULT '',
       createdAt   TEXT NOT NULL DEFAULT (datetime('now')),
       updatedAt   TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -121,12 +122,12 @@ app.get('/api/typography/:id', async (req, res) => {
 
 app.post('/api/typography', async (req, res) => {
   try {
-    const { year, dateLabel, name, description, imageUrl, position } = req.body
+    const { year, dateLabel, name, description, imageUrl, position, fontName } = req.body
     if (!year || !name) return res.status(400).json({ error: 'year and name required' })
     const result = await db.execute({
-      sql: `INSERT INTO TypographyEvent (year, dateLabel, name, description, imageUrl, position)
-            VALUES (?, ?, ?, ?, ?, ?) RETURNING *`,
-      args: [Number(year), dateLabel || fmtY(Number(year)), name, description || '', imageUrl || '', position || 'top']
+      sql: `INSERT INTO TypographyEvent (year, dateLabel, name, description, imageUrl, position, fontName)
+            VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      args: [Number(year), dateLabel || fmtY(Number(year)), name, description || '', imageUrl || '', position || 'top', fontName || '']
     })
     res.status(201).json(result.rows[0])
   } catch (e) { res.status(500).json({ error: e.message }) }
@@ -134,7 +135,7 @@ app.post('/api/typography', async (req, res) => {
 
 app.patch('/api/typography/:id', async (req, res) => {
   try {
-    const allowed = ['year', 'dateLabel', 'name', 'description', 'imageUrl', 'position']
+    const allowed = ['year', 'dateLabel', 'name', 'description', 'imageUrl', 'position', 'fontName']
     const fields = Object.keys(req.body).filter(k => allowed.includes(k))
     if (!fields.length) return res.status(400).json({ error: 'No valid fields' })
     const sets = fields.map(f => `${f} = ?`).join(', ')
